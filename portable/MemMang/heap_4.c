@@ -351,6 +351,79 @@ void * pvPortMalloc( size_t xWantedSize )
 }
 /*-----------------------------------------------------------*/
 
+void *pvPortRealloc( void *pv, size_t xWantedSize )
+{
+	size_t move_size;
+	size_t block_size;
+	BlockLink_t * pxLink;
+	void *pvReturn = NULL;
+	uint8_t * puc = ( uint8_t * ) pv;
+
+	if (xWantedSize > 0)
+	{
+		if (pv != NULL)
+		{
+	        /* The memory being freed will have an BlockLink_t structure
+             * immediately before it. */
+	        puc -= xHeapStructSize;
+
+	        /* This casting is to keep the compiler from issuing warnings. */
+	        pxLink = ( void * ) puc;
+
+	        heapVALIDATE_BLOCK_POINTER( pxLink );
+	        configASSERT( heapBLOCK_IS_ALLOCATED( pxLink ) != 0 );
+
+			if( heapBLOCK_IS_ALLOCATED( pxLink ) != 0 )
+			{
+				/* Extract allocation size with masking */
+				block_size = (pxLink->xBlockSize & ~heapBLOCK_ALLOCATED_BITMASK) - xHeapStructSize;
+
+				/* Allocate new free space */
+				pvReturn = pvPortCalloc(1, xWantedSize);
+
+				/* Check valid allocation */
+				if (pvReturn != NULL)
+				{
+					/* Move data from source to new buffer with limit size */
+					if (block_size < xWantedSize)
+					{
+						/* New free space is smaller */
+						move_size = block_size;
+					}
+					else
+					{
+						/* New free space is greater */
+						move_size = xWantedSize;
+					}
+
+					/* Copy data from source */
+					memcpy(pvReturn, pv, move_size);
+
+					/* Free block of previous allocation */
+					vPortFree(pv);
+				}
+			}
+			else
+			{
+				/* This block is not allocate, create new */
+				pvReturn = pvPortCalloc(1, xWantedSize);
+			}
+		}
+		else
+		{
+			/* Pointer is NULL, create new */
+			pvReturn = pvPortCalloc(1, xWantedSize);
+		}
+	}
+	else
+	{
+		/* Exit without memory block */
+		pvReturn = NULL;
+	}
+
+	return pvReturn;
+}
+
 void vPortFree( void * pv )
 {
     uint8_t * puc = ( uint8_t * ) pv;
