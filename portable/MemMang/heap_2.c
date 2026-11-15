@@ -292,6 +292,194 @@ void * pvPortMalloc( size_t xWantedSize )
 }
 /*-----------------------------------------------------------*/
 
+#if ( configSUPPORT_HEAP_REALLOC == 1 )
+
+/*
+ * pvPortRealloc() resizes a block in place whenever it can, using the free
+ * blocks immediately before and after it in memory:
+ *
+ * 1) If the block is shrinking, or the free block immediately after it is large
+ *    enough to make up the difference, the block stays where it is.  The
+ *    following free block is only merged in if the extra space is needed.
+ * 2) Otherwise, if a free block immediately before it is large enough (together
+ *    with any free block immediately after it), the preceding block, the block
+ *    itself and the following block are merged into one block that starts at
+ *    the preceding block.  The contents are moved down using memmove() as the
+ *    old and new locations can overlap.
+ * 3) Otherwise a new block is obtained from pvPortMalloc(), the contents are
+ *    copied into it and the original block is freed.  If that fails NULL is
+ *    returned and the original block is left unchanged.
+ *
+ * In cases 1 and 2 any excess at the end of the resized block that is large
+ * enough to be a block in its own right is split off and returned to the free
+ * list.  As elsewhere in this file, it is not combined with other free blocks.
+ *
+ * The free list is ordered by size rather than address, so the whole list is
+ * walked to find the neighbouring free blocks, and walked again to remove any
+ * that are merged.
+ */
+void * pvPortRealloc( void * pv,
+                      size_t xWantedSize )
+{
+    BlockLink_t * pxLink;
+    BlockLink_t * pxBlock;
+    BlockLink_t * pxPreceding = NULL;
+    BlockLink_t * pxFollowing = NULL;
+    BlockLink_t * pxNewBlockLink;
+    size_t xOldSize, xNewSize = 0, xMergedSize;
+    size_t xPrecedingSize = 0, xFollowingSize = 0;
+    void * pvReturn = NULL;
+
+    if( pv == NULL )
+    {
+        pvReturn = pvPortMalloc( xWantedSize );
+    }
+    else if( xWantedSize == 0 )
+    {
+        vPortFree( pv );
+    }
+    else
+    {
+        /* The block being resized will have a BlockLink_t structure
+         * immediately before it. */
+        pxLink = ( void * ) ( ( ( uint8_t * ) pv ) - xHeapStructSize );
+
+        configASSERT( heapBLOCK_IS_ALLOCATED( pxLink ) != 0 );
+        configASSERT( pxLink->pxNextFreeBlock == NULL );
+
+        if( ( heapBLOCK_IS_ALLOCATED( pxLink ) != 0 ) && ( pxLink->pxNextFreeBlock == NULL ) )
+        {
+            xOldSize = pxLink->xBlockSize & ~heapBLOCK_ALLOCATED_BITMASK;
+
+            /* Size the block as pvPortMalloc() would - large enough to also
+             * hold a BlockLink_t structure and rounded up to the byte
+             * alignment.  xNewSize is left as 0 if that would overflow. */
+            if( heapADD_WILL_OVERFLOW( xWantedSize, xHeapStructSize + ( size_t ) portBYTE_ALIGNMENT_MASK ) == 0 )
+            {
+                xNewSize = ( xWantedSize + xHeapStructSize + ( size_t ) portBYTE_ALIGNMENT_MASK ) & ~( ( size_t ) portBYTE_ALIGNMENT_MASK );
+            }
+
+            if( ( xNewSize != 0 ) && ( heapBLOCK_SIZE_IS_VALID( xNewSize ) != 0 ) )
+            {
+                vTaskSuspendAll();
+                {
+                    /* Find the free blocks either side of the block. */
+                    for( pxBlock = xStart.pxNextFreeBlock; pxBlock != &xEnd; pxBlock = pxBlock->pxNextFreeBlock )
+                    {
+                        if( ( ( ( uint8_t * ) pxBlock ) + pxBlock->xBlockSize ) == ( uint8_t * ) pxLink )
+                        {
+                            pxPreceding = pxBlock;
+                            xPrecedingSize = pxBlock->xBlockSize;
+                        }
+                        else if( ( ( ( uint8_t * ) pxLink ) + xOldSize ) == ( uint8_t * ) pxBlock )
+                        {
+                            pxFollowing = pxBlock;
+                            xFollowingSize = pxBlock->xBlockSize;
+                        }
+                    }
+
+                    xMergedSize = xOldSize;
+
+                    if( xNewSize <= ( xOldSize + xFollowingSize ) )
+                    {
+                        /* Case 1 - resize in place. */
+                        if( xNewSize > xOldSize )
+                        {
+                            xMergedSize += xFollowingSize;
+                        }
+                        else
+                        {
+                            pxFollowing = NULL;
+                        }
+
+                        pxPreceding = NULL;
+                        pvReturn = pv;
+                    }
+                    else if( xNewSize <= ( xPrecedingSize + xOldSize + xFollowingSize ) )
+                    {
+                        /* Case 2 - merge with the neighbouring free blocks.  The
+                         * contents are moved once the neighbours are unlinked. */
+                        xMergedSize += xPrecedingSize + xFollowingSize;
+                        pxLink = pxPreceding;
+                        pvReturn = ( void * ) ( ( ( uint8_t * ) pxLink ) + xHeapStructSize );
+                    }
+
+                    if( pvReturn != NULL )
+                    {
+                        /* Unlink whichever neighbours are being merged in.  Those
+                         * that are not are NULL so never match. */
+                        pxBlock = &xStart;
+
+                        while( pxBlock->pxNextFreeBlock != &xEnd )
+                        {
+                            if( ( pxBlock->pxNextFreeBlock == pxPreceding ) || ( pxBlock->pxNextFreeBlock == pxFollowing ) )
+                            {
+                                pxBlock->pxNextFreeBlock = pxBlock->pxNextFreeBlock->pxNextFreeBlock;
+                            }
+                            else
+                            {
+                                pxBlock = pxBlock->pxNextFreeBlock;
+                            }
+                        }
+
+                        if( pvReturn != pv )
+                        {
+                            ( void ) memmove( pvReturn, pv, xOldSize - xHeapStructSize );
+                        }
+
+                        if( ( xMergedSize - xNewSize ) > heapMINIMUM_BLOCK_SIZE )
+                        {
+                            /* Return the excess to the free list. */
+                            pxNewBlockLink = ( void * ) ( ( ( uint8_t * ) pxLink ) + xNewSize );
+                            pxNewBlockLink->xBlockSize = xMergedSize - xNewSize;
+                            xMergedSize = xNewSize;
+
+                            #if ( configHEAP_CLEAR_MEMORY_ON_FREE == 1 )
+                            {
+                                ( void ) memset( ( ( uint8_t * ) pxNewBlockLink ) + xHeapStructSize, 0, pxNewBlockLink->xBlockSize - xHeapStructSize );
+                            }
+                            #endif
+
+                            prvInsertBlockIntoFreeList( ( pxNewBlockLink ) );
+                        }
+
+                        /* Whatever was merged in or split off, the free space
+                         * changes by the difference in the block's size. */
+                        xFreeBytesRemaining += xOldSize;
+                        xFreeBytesRemaining -= xMergedSize;
+
+                        pxLink->xBlockSize = xMergedSize;
+                        heapALLOCATE_BLOCK( pxLink );
+                        pxLink->pxNextFreeBlock = NULL;
+
+                        traceFREE( pv, xOldSize );
+                        traceMALLOC( pvReturn, xMergedSize );
+                    }
+                }
+                ( void ) xTaskResumeAll();
+            }
+
+            if( pvReturn == NULL )
+            {
+                /* Case 3 - move the block.  This is only reached when growing,
+                 * so all of the old contents fit in the new block. */
+                pvReturn = pvPortMalloc( xWantedSize );
+
+                if( pvReturn != NULL )
+                {
+                    ( void ) memcpy( pvReturn, pv, xOldSize - xHeapStructSize );
+                    vPortFree( pv );
+                }
+            }
+        }
+    }
+
+    return pvReturn;
+}
+
+#endif /* configSUPPORT_HEAP_REALLOC */
+/*-----------------------------------------------------------*/
+
 void vPortFree( void * pv )
 {
     uint8_t * puc = ( uint8_t * ) pv;

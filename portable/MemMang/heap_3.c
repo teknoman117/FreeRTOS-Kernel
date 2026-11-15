@@ -80,6 +80,54 @@ void * pvPortMalloc( size_t xWantedSize )
 }
 /*-----------------------------------------------------------*/
 
+#if ( configSUPPORT_HEAP_REALLOC == 1 )
+
+/*
+ * Resizing is delegated to the C library realloc().  A xWantedSize of 0 is
+ * handled here, rather than passed on, so that it frees the block as it does
+ * with the other heap implementations - the C library behaviour in that case
+ * is implementation defined (and undefined as of C23).
+ */
+void * pvPortRealloc( void * pv,
+                      size_t xWantedSize )
+{
+    void * pvReturn = NULL;
+
+    if( xWantedSize == 0 )
+    {
+        vPortFree( pv );
+    }
+    else
+    {
+        vTaskSuspendAll();
+        {
+            pvReturn = realloc( pv, xWantedSize );
+
+            if( ( pvReturn != NULL ) && ( pv != NULL ) )
+            {
+                traceFREE( pv, 0 );
+            }
+
+            traceMALLOC( pvReturn, xWantedSize );
+        }
+        ( void ) xTaskResumeAll();
+
+        #if ( configUSE_MALLOC_FAILED_HOOK == 1 )
+        {
+            if( pvReturn == NULL )
+            {
+                vApplicationMallocFailedHook();
+            }
+        }
+        #endif
+    }
+
+    return pvReturn;
+}
+
+#endif /* configSUPPORT_HEAP_REALLOC */
+/*-----------------------------------------------------------*/
+
 void vPortFree( void * pv )
 {
     if( pv != NULL )
